@@ -54,7 +54,7 @@ app.use((req, res, next) => {
 const port = 3010;
 
 app.get('/', (req, res) => {
-  res.send('Hola LTI!');
+  res.send('Hola LTI XXXX!');
 });
 
 app.use((err: any, req: Request, res: Response, next: NextFunction) => {
