@@ -1,0 +1,162 @@
+name: PR Deploy to EC2
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    branches: [main, develop]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: deploy-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: 18
+  REMOTE_DIR: /var/www/app/current
+  PM2_APP: backend
+  RUN_MIGRATIONS: "false" # set to "true" in secrets if you want Prisma migrations during deploy
+  SSH_PORT: ${{ secrets.SSH_PORT || '22' }}
+  CI: true
+
+jobs:
+  build-and-deploy:
+    name: Build & Deploy (PR)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    env:
+      EC2_INSTANCE: ${{ secrets.EC2_INSTANCE }}
+      EC2_USER: ${{ secrets.EC2_USER }}
+      EC2_SSH_PRIVATE_KEY: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+      BACKEND_ENV_B64: ${{ secrets.BACKEND_ENV_B64 }}
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+          cache-dependency-path: |
+            frontend/package-lock.json
+            backend/package-lock.json
+
+      - name: Install frontend deps
+        working-directory: frontend
+        run: npm ci
+
+      # - name: Test frontend
+      #   working-directory: frontend
+      #   run: npm run test -- --watch=false
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Install backend deps
+        working-directory: backend
+        run: npm ci
+
+      - name: Test backend
+        working-directory: backend
+        run: npm test -- --runInBand
+
+      - name: Build backend
+        working-directory: backend
+        run: npm run build
+
+      - name: Package frontend artifact
+        run: tar -czf /tmp/frontend.tar.gz -C frontend build
+
+      - name: Package backend artifact
+        run: |
+          tar -czf /tmp/backend.tar.gz \
+            -C backend dist package.json package-lock.json prisma
+
+      - name: Validate required secrets
+        run: |
+          if [ -z "${EC2_INSTANCE}" ] || [ -z "${EC2_USER}" ] || [ -z "${EC2_SSH_PRIVATE_KEY}" ]; then
+            echo "Missing EC2 secrets. Please set EC2_INSTANCE, EC2_USER, and EC2_SSH_PRIVATE_KEY."
+            exit 1
+          fi
+
+      - name: Prepare SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${EC2_SSH_PRIVATE_KEY}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          printf "Host ec2-target\n  HostName %s\n  User %s\n  Port %s\n  StrictHostKeyChecking no\n" "$EC2_INSTANCE" "$EC2_USER" "${SSH_PORT:-22}" > ~/.ssh/config
+
+      - name: Copy artifacts to EC2
+        run: scp -P "${SSH_PORT:-22}" /tmp/frontend.tar.gz /tmp/backend.tar.gz ec2-target:/tmp/
+
+      - name: Deploy on EC2 (Amazon Linux)
+        env:
+          REMOTE_DIR: ${{ env.REMOTE_DIR }}
+          PM2_APP: ${{ env.PM2_APP }}
+          RUN_MIGRATIONS: ${{ env.RUN_MIGRATIONS }}
+          BACKEND_ENV_B64: ${{ env.BACKEND_ENV_B64 }}
+          DATABASE_URL: ${{ env.DATABASE_URL }}
+          EC2_USER: ${{ env.EC2_USER }}
+        run: |
+          ssh ec2-target "REMOTE_DIR='${REMOTE_DIR}' PM2_APP='${PM2_APP}' RUN_MIGRATIONS='${RUN_MIGRATIONS}' BACKEND_ENV_B64='${BACKEND_ENV_B64}' DATABASE_URL='${DATABASE_URL}' EC2_USER='${EC2_USER}' bash -s" <<'EOF'
+          set -euo pipefail
+
+          REMOTE_DIR="${REMOTE_DIR:-/var/www/app/current}"
+          FRONTEND_DIR="${REMOTE_DIR}/frontend"
+          BACKEND_DIR="${REMOTE_DIR}/backend"
+          PM2_APP="${PM2_APP:-backend}"
+          RUN_MIGRATIONS="${RUN_MIGRATIONS:-false}"
+
+          sudo mkdir -p "$FRONTEND_DIR" "$BACKEND_DIR"
+          sudo chown -R "$EC2_USER":"$EC2_USER" "$REMOTE_DIR" || true
+
+          rm -rf "$FRONTEND_DIR"/*
+          tar -xzf /tmp/frontend.tar.gz -C "$FRONTEND_DIR"
+
+          if [ -d "$BACKEND_DIR" ]; then
+            find "$BACKEND_DIR" -mindepth 1 -maxdepth 1 ! -name ".env" -exec rm -rf {} +
+          fi
+          tar -xzf /tmp/backend.tar.gz -C "$BACKEND_DIR"
+
+          if [ -n "${BACKEND_ENV_B64:-}" ]; then
+            echo "$BACKEND_ENV_B64" | base64 -d > "$BACKEND_DIR/.env"
+          fi
+
+          cd "$BACKEND_DIR"
+          npm ci --omit=dev
+
+          if [ "$RUN_MIGRATIONS" = "true" ] && [ -f "prisma/schema.prisma" ]; then
+            npx prisma migrate deploy
+          fi
+
+          if ! command -v pm2 >/dev/null 2>&1; then
+            sudo npm install -g pm2
+          fi
+
+          pm2 reload "$PM2_APP" || pm2 start dist/index.js --name "$PM2_APP"
+          EOF
+
+      - name: PR status comment
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        env:
+          JOB_STATUS: ${{ job.status }}
+        with:
+          script: |
+            const status = process.env.JOB_STATUS;
+            const messages = {
+              success: '✅ Deploy to EC2 (frontend+backend) succeeded.',
+              failure: '❌ Deploy to EC2 failed. Check workflow logs.'
+            };
+            const body = messages[status] || `ℹ️ Deploy finished with status: ${status}.`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body,
+            });
